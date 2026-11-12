@@ -233,19 +233,56 @@ class Database:
         try:
             cur = conn.cursor()
             p = self._ph()
+            # 1. Pehle bilkul fresh posts uthao jo abhi tak KISI bhi target channel me nahi gaye
             cur.execute(
                 f"""
                 SELECT p.message_id
                 FROM posts p
-                LEFT JOIN sent_logs s
-                  ON p.message_id = s.message_id AND s.target_channel_id = {p}
-                WHERE s.message_id IS NULL
+                WHERE NOT EXISTS (
+                    SELECT 1 FROM sent_logs s WHERE s.message_id = p.message_id
+                )
                 ORDER BY p.message_id ASC
                 LIMIT {p}
                 """,
-                (target_channel_id, limit),
+                (limit,),
             )
-            return [int(r[0]) for r in cur.fetchall()]
+            fresh_ids = [int(r[0]) for r in cur.fetchall()]
+
+            # 2. Agar fresh posts kam padein, to bache hue slots me doosre channels ke posts
+            #    uthao jo ISS target channel me abhi tak nahi gaye (same channel me kabhi repeat nahi hoga)
+            remaining = limit - len(fresh_ids)
+            if remaining > 0:
+                if fresh_ids:
+                    placeholders = ", ".join([p] * len(fresh_ids))
+                    cur.execute(
+                        f"""
+                        SELECT p.message_id
+                        FROM posts p
+                        LEFT JOIN sent_logs s
+                          ON p.message_id = s.message_id AND s.target_channel_id = {p}
+                        WHERE s.message_id IS NULL
+                          AND p.message_id NOT IN ({placeholders})
+                        ORDER BY p.message_id ASC
+                        LIMIT {p}
+                        """,
+                        (target_channel_id, *fresh_ids, remaining),
+                    )
+                else:
+                    cur.execute(
+                        f"""
+                        SELECT p.message_id
+                        FROM posts p
+                        LEFT JOIN sent_logs s
+                          ON p.message_id = s.message_id AND s.target_channel_id = {p}
+                        WHERE s.message_id IS NULL
+                        ORDER BY p.message_id ASC
+                        LIMIT {p}
+                        """,
+                        (target_channel_id, remaining),
+                    )
+                fresh_ids.extend(int(r[0]) for r in cur.fetchall())
+
+            return fresh_ids
         finally:
             conn.close()
 
@@ -510,144 +547,4 @@ async def run_auto_post_cycle(bot) -> str:
     if not targets:
         return "⚠️ Koi target channel add nahi hai. `/add -100xxxx` use karo."
 
-    batch_size = int(db.get_setting("batch_size") or DEFAULT_BATCH_SIZE)
-    mode = db.get_setting("mode") or DEFAULT_MODE
-
-    total_sent = 0
-    report_lines = []
-
-    for target_id, title in targets:
-        unsent_ids = db.get_unsent_posts(target_id, batch_size)
-        if not unsent_ids:
-            report_lines.append(f"• {title or target_id}: 0 new posts")
-            continue
-
-        sent_count = 0
-        for msg_id in unsent_ids:
-            try:
-                if mode == "copy":
-                    await bot.copy_message(
-                        chat_id=target_id,
-                        from_chat_id=main_id,
-                        message_id=msg_id,
-                    )
-                else:
-                    await bot.forward_message(
-                        chat_id=target_id,
-                        from_chat_id=main_id,
-                        message_id=msg_id,
-                    )
-                db.mark_sent(target_id, msg_id)
-                sent_count += 1
-                total_sent += 1
-                await asyncio.sleep(1.5)  # Safe delay against Telegram FloodWait
-
-            except RetryAfter as e:
-                wait_sec = int(e.retry_after) + 1
-                logger.warning(f"FloodWait hit! Sleeping {wait_sec}s...")
-                await asyncio.sleep(wait_sec)
-                # Retry once after wait
-                try:
-                    if mode == "copy":
-                        await bot.copy_message(chat_id=target_id, from_chat_id=main_id, message_id=msg_id)
-                    else:
-                        await bot.forward_message(chat_id=target_id, from_chat_id=main_id, message_id=msg_id)
-                    db.mark_sent(target_id, msg_id)
-                    sent_count += 1
-                    total_sent += 1
-                except TelegramError as retry_err:
-                    logger.error(f"Failed retry for msg {msg_id} -> {target_id}: {retry_err}")
-
-            except Forbidden as e:
-                logger.error(f"Bot removed or not admin in {target_id}: {e}")
-                report_lines.append(f"• {title or target_id}: ❌ Bot admin nahi hai!")
-                break
-
-            except TelegramError as e:
-                logger.error(f"Error sending msg {msg_id} -> {target_id}: {e}")
-                # Mark deleted/invalid source messages so they don't block the queue forever
-                if "message to forward not found" in str(e).lower() or "message not found" in str(e).lower():
-                    db.mark_sent(target_id, msg_id)
-
-        report_lines.append(f"• {title or target_id}: ✅ {sent_count} posts sent")
-
-    return f"📊 Cycle Complete (Total sent: {total_sent}):\n" + "\n".join(report_lines)
-
-
-async def scheduler_loop(bot):
-    logger.info("Auto-posting scheduler started.")
-    while True:
-        try:
-            interval_mins = int(db.get_setting("interval_minutes") or DEFAULT_INTERVAL_MINUTES)
-            await asyncio.sleep(interval_mins * 60)
-            logger.info("Running scheduled auto-post cycle...")
-            summary = await run_auto_post_cycle(bot)
-            logger.info(summary)
-        except asyncio.CancelledError:
-            break
-        except Exception as e:
-            logger.exception(f"Scheduler error: {e}")
-            await asyncio.sleep(60)
-
-
-# ==========================================
-# WEB SERVER (Keeps Render Free Tier Awake)
-# ==========================================
-async def health_handler(request):
-    return web.json_response({"status": "ok", "bot": "running"})
-
-
-async def main():
-    global db
-    if not BOT_TOKEN:
-        raise RuntimeError("BOT_TOKEN environment variable is missing!")
-
-    db = Database(DATABASE_URL)
-    logger.info(f"Database initialized (PostgreSQL={db.use_pg})")
-
-    # Build Telegram Bot Application
-    ptb_app = Application.builder().token(BOT_TOKEN).build()
-
-    ptb_app.add_handler(CommandHandler("start", cmd_start))
-    ptb_app.add_handler(CommandHandler("help", cmd_start))
-    ptb_app.add_handler(CommandHandler("setmain", cmd_setmain))
-    ptb_app.add_handler(CommandHandler("add", cmd_add))
-    ptb_app.add_handler(CommandHandler("remove", cmd_remove))
-    ptb_app.add_handler(CommandHandler("list", cmd_list))
-    ptb_app.add_handler(CommandHandler("mode", cmd_mode))
-    ptb_app.add_handler(CommandHandler("setbatch", cmd_setbatch))
-    ptb_app.add_handler(CommandHandler("setinterval", cmd_setinterval))
-    ptb_app.add_handler(CommandHandler("sendnow", cmd_sendnow))
-
-    ptb_app.add_handler(MessageHandler(filters.UpdateType.CHANNEL_POST, handle_channel_post))
-    ptb_app.add_handler(MessageHandler(filters.ChatType.PRIVATE & filters.FORWARDED, handle_forwarded_in_dm))
-
-    # Start lightweight HTTP server for Render + UptimeRobot
-    web_app = web.Application()
-    web_app.router.add_get("/", health_handler)
-    web_app.router.add_get("/healthz", health_handler)
-    runner = web.AppRunner(web_app)
-    await runner.setup()
-    site = web.TCPSite(runner, "0.0.0.0", PORT)
-    await site.start()
-    logger.info(f"Health-check web server listening on port {PORT}")
-
-    # Start Telegram Bot + Background Scheduler
-    await ptb_app.initialize()
-    await ptb_app.start()
-    await ptb_app.updater.start_polling(allowed_updates=Update.ALL_TYPES)
-
-    scheduler_task = asyncio.create_task(scheduler_loop(ptb_app.bot))
-
-    try:
-        await asyncio.Event().wait()
-    finally:
-        scheduler_task.cancel()
-        await ptb_app.updater.stop()
-        await ptb_app.stop()
-        await ptb_app.shutdown()
-        await runner.cleanup()
-
-
-if __name__ == "__main__":
-    asyncio.run(main())
+    batch_s
